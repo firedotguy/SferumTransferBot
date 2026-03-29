@@ -1,6 +1,7 @@
 import logging
 from logging.handlers import RotatingFileHandler
 from sys import stdout
+from os import mkdir, listdir
 
 # Custom Formatter to exclude tracebacks for the console
 class ConsoleFormatterWithNoTraceback(logging.Formatter):
@@ -35,6 +36,8 @@ class ConsoleFormatterWithNoTraceback(logging.Formatter):
         return formatted_message
 
 def setup_logger():
+    if 'data' not in listdir():
+        mkdir('data')
     log_file = 'data/bot.log'
     api_log_file = 'data/api_responses.log'
 

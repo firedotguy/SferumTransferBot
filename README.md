@@ -1,6 +1,6 @@
 # Sferum Transfer Bot
 
-> [!DANGER]
+> [!CAUTION]
 > Может блокировать аккаунт [#10](https://github.com/Sharkow1743/SferumTransferBot/issues/10#issue-3961856910)
 
 Бот для пересылки сообщений из Max в Telegram.
