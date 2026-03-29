@@ -93,23 +93,25 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
     """
     global last_sender_id
     assert message.sender
-    assert message.chat_id
 
-    if not forwarded and message.chat_id != MAX_CHAT_ID:
+    if not forwarded and getattr(message, 'chat_id', None) != MAX_CHAT_ID:
         return None
     if client.me and message.sender == client.me.id:
         return None
 
+    assert message.chat_id
+
     msg_id_str = str(message.id) if message.id else "FWD_PART"
     l.info(f"Processing Max Message ID: {msg_id_str} (Forwarded: {forwarded})")
+    sender = get_sender_name(message.sender)
 
     # This will track the FIRST Telegram ID associated with this Max message
     first_tg_id = None
 
     header_prefix = ""
     if not forwarded and last_sender_id != message.sender:
-        header_prefix = f"*{message.sender} написал:*\n"
-        last_sender_id = message.sender
+        header_prefix = f"*{sender} написал:*\n"
+        last_sender_id = sender
 
     # 3. Reply Mapping (Lookup)
     reply_to_tg_id = None
@@ -136,7 +138,7 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
     # 5. Content Prep
     text_content = message.text or ""
     if forwarded:
-        text_content = f"↪ Переслано от {message.sender}:_\n{text_content}"
+        text_content = f"↪ Переслано от {sender}:_\n{text_content}"
     text_content = header_prefix + text_content
 
     # 6. Attachments
