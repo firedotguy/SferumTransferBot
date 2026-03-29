@@ -27,8 +27,6 @@ CHECK_TIME = False # проверять ли время перед отправ�
 START_TIME = t(7, 0)
 END_TIME = t(22, 0)
 
-BOT_POST_MESSAGE = None # доп текст в сообщении от бота
-BOT_MESSAGE_PREFIX = "⫻" # префикс для отпарвляемых сообщений
 BOT_START_MESSAGE = None # стартовое сообщение бота отпарвляемое в макс при запуске (если None, то не отпралвять)
 
 REQUESTS_TIMEOUT = 15 # таймаут запросов
@@ -87,22 +85,7 @@ async def get_sender_name(user_id: int) -> str:
         l.error(f"Could not fetch profile for ID {user_id}: {e}")
     return f"User {user_id}"
 
-# --- Logic: Max -> Telegram ---
 
-async def get_smart_sender_info(user_id: int):
-    """Fetches name and determines gender-specific verb suffix."""
-    try:
-        user = await client.get_user(user_id=user_id)
-        if user:
-            name = f"{user.names[0].name}" if user.names else f"User {user_id}"
-            # Sex: 1 is Female, 2 is Male. Default to 'л' (male/neutral)
-            suffix = "ла" if user.gender == 1 else "л"
-            return name, suffix
-    except Exception as e:
-        l.error(f"Error fetching user {user_id}: {e}")
-    return f"User {user_id}", "л(-а)"
-
-# --- Logic: Max -> Telegram ---
 
 async def process_max_message(message: Message, forwarded: bool = False) -> int | None:
     """
@@ -112,11 +95,9 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
     assert message.sender
     assert message.chat_id
 
-    # 1. Top-level filter
-    l.debug(message)
     if not forwarded and message.chat_id != MAX_CHAT_ID:
         return None
-    if message.text and message.text.startswith(BOT_MESSAGE_PREFIX):
+    if client.me and message.sender == client.me.id:
         return None
 
     msg_id_str = str(message.id) if message.id else "FWD_PART"
@@ -125,108 +106,101 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
     # This will track the FIRST Telegram ID associated with this Max message
     first_tg_id = None
 
-    try:
-        sender_name, gender_suffix = await get_smart_sender_info(message.sender)
+    header_prefix = ""
+    if not forwarded and last_sender_id != message.sender:
+        header_prefix = f"*{message.sender} написал:*\n"
+        last_sender_id = message.sender
 
-        # 2. Header Logic
-        if not forwarded and last_sender_id != message.sender:
-            header_text = f"{BOT_MESSAGE_PREFIX} *{sender_name} написа{gender_suffix}:*"
-            sent_header = await bot.send_message(TG_CHAT_ID, header_text, parse_mode="Markdown")
-            first_tg_id = sent_header.message_id
-            last_sender_id = message.sender
+    # 3. Reply Mapping (Lookup)
+    reply_to_tg_id = None
+    if message.link and message.link.type == 'REPLY':
+        replied_max_id = str(message.link.message.id)
+        reply_to_tg_id = msgs_map.get(replied_max_id)
+        if reply_to_tg_id:
+            l.info(f"Reply Link: Max[{replied_max_id}] -> TG[{reply_to_tg_id}]")
 
-        # 3. Reply Mapping (Lookup)
-        reply_to_tg_id = None
-        if message.link and message.link.type == 'REPLY':
-            replied_max_id = str(message.link.message.id)
-            reply_to_tg_id = msgs_map.get(replied_max_id)
-            if reply_to_tg_id:
-                l.info(f"Reply Link: Max[{replied_max_id}] -> TG[{reply_to_tg_id}]")
+    # 4. Forward Recursion
+    fwds_to_process = []
+    if message.link and message.link.type == 'FORWARD':
+        fwds_to_process.append(message.link.message)
+    if hasattr(message, 'fwd_messages') and message.fwd_messages: # pyright: ignore[reportAttributeAccessIssue]
+        fwds_to_process.extend(message.fwd_messages) # pyright: ignore[reportAttributeAccessIssue]
 
-        # 4. Forward Recursion
-        fwds_to_process = []
-        if message.link and message.link.type == 'FORWARD':
-            fwds_to_process.append(message.link.message)
-        if hasattr(message, 'fwd_messages') and message.fwd_messages: # pyright: ignore[reportAttributeAccessIssue]
-            fwds_to_process.extend(message.fwd_messages) # pyright: ignore[reportAttributeAccessIssue]
+    for fwd_msg in fwds_to_process:
+        # Recursive call returns the TG ID of the forwarded message
+        fwd_tg_id = await process_max_message(fwd_msg, forwarded=True)
+        # If our container doesn't have a TG ID yet (no header), use the first forward's ID
+        if first_tg_id is None:
+            first_tg_id = fwd_tg_id
 
-        for fwd_msg in fwds_to_process:
-            # Recursive call returns the TG ID of the forwarded message
-            fwd_tg_id = await process_max_message(fwd_msg, forwarded=True)
-            # If our container doesn't have a TG ID yet (no header), use the first forward's ID
-            if first_tg_id is None:
-                first_tg_id = fwd_tg_id
+    # 5. Content Prep
+    text_content = message.text or ""
+    if forwarded:
+        text_content = f"↪ Переслано от {message.sender}:_\n{text_content}"
+    text_content = header_prefix + text_content
 
-        # 5. Content Prep
-        text_content = message.text or ""
-        if forwarded:
-            text_content = f"↪ Переслано от {sender_name}:_\n{text_content}"
-
-        # 6. Attachments
-        if message.attaches:
-            for attach in message.attaches:
-                sent = None
-                try:
-                    if isinstance(attach, PhotoAttach):
-                        f_bytes = await download_content(attach.base_url)
-                        sent = await bot.send_photo(
+    # 6. Attachments
+    if message.attaches:
+        for attach in message.attaches:
+            sent = None
+            try:
+                if isinstance(attach, PhotoAttach):
+                    f_bytes = await download_content(attach.base_url)
+                    sent = await bot.send_photo(
+                        TG_CHAT_ID,
+                        photo=BufferedInputFile(f_bytes.getvalue(), filename="photo.jpg"),
+                        caption=text_content if text_content else None,
+                        reply_to_message_id=reply_to_tg_id,
+                        parse_mode="Markdown"
+                    )
+                elif isinstance(attach, VideoAttach):
+                    vid_info = await client.get_video_by_id(message.chat_id, message.id, attach.video_id)
+                    if vid_info and vid_info.url:
+                        f_bytes = await download_content(vid_info.url)
+                        sent = await bot.send_video(
                             TG_CHAT_ID,
-                            photo=BufferedInputFile(f_bytes.getvalue(), filename="photo.jpg"),
+                            video=BufferedInputFile(f_bytes.getvalue(), filename="video.mp4"),
                             caption=text_content if text_content else None,
                             reply_to_message_id=reply_to_tg_id,
                             parse_mode="Markdown"
                         )
-                    elif isinstance(attach, VideoAttach):
-                        vid_info = await client.get_video_by_id(message.chat_id, message.id, attach.video_id)
-                        if vid_info and vid_info.url:
-                            f_bytes = await download_content(vid_info.url)
-                            sent = await bot.send_video(
-                                TG_CHAT_ID,
-                                video=BufferedInputFile(f_bytes.getvalue(), filename="video.mp4"),
-                                caption=text_content if text_content else None,
-                                reply_to_message_id=reply_to_tg_id,
-                                parse_mode="Markdown"
-                            )
-                    elif isinstance(attach, FileAttach):
-                        file_info = await client.get_file_by_id(message.chat_id, message.id, attach.file_id)
-                        if file_info and file_info.url:
-                            f_bytes = await download_content(file_info.url)
-                            sent = await bot.send_document(
-                                TG_CHAT_ID,
-                                document=BufferedInputFile(f_bytes.getvalue(), filename=getattr(file_info, 'name', 'file')),
-                                caption=text_content if text_content else None,
-                                reply_to_message_id=reply_to_tg_id,
-                                parse_mode="Markdown"
-                            )
+                elif isinstance(attach, FileAttach):
+                    file_info = await client.get_file_by_id(message.chat_id, message.id, attach.file_id)
+                    if file_info and file_info.url:
+                        f_bytes = await download_content(file_info.url)
+                        sent = await bot.send_document(
+                            TG_CHAT_ID,
+                            document=BufferedInputFile(f_bytes.getvalue(), filename=getattr(file_info, 'name', 'file')),
+                            caption=text_content if text_content else None,
+                            reply_to_message_id=reply_to_tg_id,
+                            parse_mode="Markdown"
+                        )
 
-                    if sent:
-                        if first_tg_id is None: first_tg_id = sent.message_id
-                        text_content = "" # Only send caption once
-                except Exception as e:
-                    l.error(f"Attachment error: {e}")
+                if sent:
+                    if first_tg_id is None: first_tg_id = sent.message_id
+                    text_content = "" # Only send caption once
+            except Exception as e:
+                l.error(f"Attachment error: {e}")
 
-        # 7. Remaining Text
-        if text_content.strip():
-            sent_msg = await bot.send_message(
-                TG_CHAT_ID,
-                text_content,
-                reply_to_message_id=reply_to_tg_id,
-                parse_mode="Markdown"
-            )
-            if first_tg_id is None: first_tg_id = sent_msg.message_id
+    # 7. Remaining Text
+    if text_content.strip():
+        sent_msg = await bot.send_message(
+            TG_CHAT_ID,
+            text_content,
+            reply_to_message_id=reply_to_tg_id,
+            parse_mode="Markdown"
+        )
+        if first_tg_id is None: first_tg_id = sent_msg.message_id
 
-        # 8. Save Mapping
-        # We save mapping for both forwarded items and top-level containers
-        if first_tg_id and message.id:
-            msgs_map[str(message.id)] = first_tg_id
-            data_handler.save('msgs', msgs_map)
-            l.info(f"Mapping Saved: Max[{message.id}] == TG[{first_tg_id}]")
+    # 8. Save Mapping
+    # We save mapping for both forwarded items and top-level containers
+    if first_tg_id and message.id:
+        msgs_map[str(message.id)] = first_tg_id
+        data_handler.save('msgs', msgs_map)
+        l.info(f"Mapping Saved: Max[{message.id}] == TG[{first_tg_id}]")
 
-        return first_tg_id
+    return first_tg_id
 
-    except Exception as e:
-        l.error(f"Error: {e}", exc_info=True)
-        return None
 
 @client.on_message()
 async def max_message_handler(message: Message):
@@ -256,14 +230,6 @@ async def send_handler(message: types.Message):
             await message.reply("Нельзя отправить пустое сообщение.")
             return
 
-        # Get username
-        username = message.from_user.full_name or message.from_user.username
-
-        # Create full text
-        full_text = f"{BOT_MESSAGE_PREFIX} *{username} написал(-а):*\n{text_to_send}"
-        if BOT_POST_MESSAGE:
-            full_text += f"\n{BOT_MESSAGE_PREFIX} {BOT_POST_MESSAGE}"
-
         # Get id of replied message in MAX
         reply_to_max_id = None
         if message.reply_to_message:
@@ -277,7 +243,7 @@ async def send_handler(message: types.Message):
         # Send message
         sent_msg = await client.send_message(
             chat_id=MAX_CHAT_ID,
-            text=full_text,
+            text=text_to_send,
             reply_to=reply_to_max_id
         )
 
