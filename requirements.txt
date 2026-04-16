@@ -1,4 +1,0 @@
-aiogram
-aiohttp
-maxapi-python
-python-dotenv

@@ -1,8 +1,9 @@
 from os import name as os_name, getenv
-from asyncio import run, wait, create_task, FIRST_COMPLETED, Event, get_running_loop
+from asyncio import run, wait, create_task, FIRST_COMPLETED, Event, get_running_loop, sleep
 from logging import getLogger
-import signal
+from signal import SIGINT, SIGTERM
 from datetime import datetime, time as t
+from time import time as time_since_epoch
 from io import BytesIO
 
 import aiohttp
@@ -13,13 +14,14 @@ from aiogram.types import BufferedInputFile
 
 from pymax import SocketMaxClient, MaxClient, Message
 from pymax.types import FileAttach, PhotoAttach, VideoAttach
+from pymax.filters import Filters
 
 import data_handler
 from logger import setup_logger
 
 # --- Initial Setup ---
 setup_logger()
-l = getLogger("api_logger")
+l = getLogger(__name__)
 load_dotenv()
 
 # --- Constants & Configuration ---
@@ -103,7 +105,7 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
 
     msg_id_str = str(message.id) if message.id else "FWD_PART"
     l.info(f"Processing Max Message ID: {msg_id_str} (Forwarded: {forwarded})")
-    sender = get_sender_name(message.sender)
+    sender = await get_sender_name(message.sender)
 
     # This will track the FIRST Telegram ID associated with this Max message
     first_tg_id = None
@@ -200,14 +202,28 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
         msgs_map[str(message.id)] = first_tg_id
         data_handler.save('msgs', msgs_map)
         l.info(f"Mapping Saved: Max[{message.id}] == TG[{first_tg_id}]")
+    await client.read_message(message.id, MAX_CHAT_ID)
 
     return first_tg_id
 
 
-@client.on_message()
+@client.on_message(Filters.chat(MAX_CHAT_ID))
 async def max_message_handler(message: Message):
     # PyMax entry point
     await process_max_message(message)
+
+@client.on_start
+async def on_start():
+    l.info("on_start: getting chat")
+    chat = await client.get_chat(MAX_CHAT_ID)
+    l.info(f"on_start: chat.new_messages={chat.new_messages}")
+    if chat.new_messages > 0:
+        l.info("on_start: fetching history")
+        messages = await client.fetch_history(chat.id, int(time_since_epoch() * 1000), 0, chat.new_messages) or []
+        l.info(f"on_start: fetched {len(messages)} messages")
+        for message in messages:
+            message.chat_id = chat.id
+            await process_max_message(message)
 
 # --- Logic: Telegram -> Max ---
 
@@ -278,13 +294,21 @@ async def main():
     stop_event = Event()
     loop = get_running_loop()
     if os_name != 'nt':
-        for sig in (signal.SIGINT, signal.SIGTERM):
+        for sig in (SIGINT, SIGTERM):
             loop.add_signal_handler(sig, stop_event.set)
 
     # 2. Start Telegram Poller FIRST (as a background task)
     l.info("Starting Telegram Polling...")
-    # This creates the task but doesn't block execution
-    tg_task = create_task(dp.start_polling(bot))
+
+    async def tg_polling_with_retry():
+        while not stop_event.is_set():
+            try:
+                await dp.start_polling(bot)
+            except Exception as e:
+                l.error(f"TG polling crashed: {e}. Retrying in 30s...")
+                await sleep(30)
+
+    tg_task = create_task(tg_polling_with_retry())
 
     # 3. Run startup logic (invite links, etc.)
     await on_startup()
@@ -298,10 +322,14 @@ async def main():
         # We use a task for Max as well to allow clean shutdowns
         # Wait for either the stop signal or the tasks to fail
         stop_task = create_task(stop_event.wait())
-        await wait(
+        done, _ = await wait(
             [tg_task, max_task, stop_task],
             return_when=FIRST_COMPLETED
         )
+        for task in done:
+            name = {tg_task: "tg_task", max_task: "max_task", stop_task: "stop_task"}.get(task, "?")
+            exc = task.exception() if not task.cancelled() else None
+            l.warning(f"Task finished: {name}, exception={exc!r}")
 
     except Exception as e:
         l.error(f"Critical error in main loop: {e}")
