@@ -15,6 +15,7 @@ from aiogram.types import BufferedInputFile
 from pymax import SocketMaxClient, MaxClient, Message
 from pymax.types import FileAttach, PhotoAttach, VideoAttach
 from pymax.filters import Filters
+from pymax.files import Photo
 
 import data_handler
 from logger import setup_logger
@@ -244,7 +245,7 @@ async def send_handler(message: types.Message):
 
         # Check empty message
         text_to_send = (message.text or '').replace("/send", "", 1).strip()
-        if not text_to_send:
+        if not text_to_send and not message.photo:
             await message.reply("Нельзя отправить пустое сообщение.")
             return
 
@@ -258,11 +259,16 @@ async def send_handler(message: types.Message):
                     reply_to_max_id = mid
                     break
 
+        photo = None
+        if message.photo:
+            photo = await bot.download(message.photo[-1])
+
         # Send message
         sent_msg = await client.send_message(
             chat_id=MAX_CHAT_ID,
             text=text_to_send,
-            reply_to=reply_to_max_id
+            reply_to=reply_to_max_id,
+            attachment=Photo(photo.read(), path='1.jpg') if photo else None
         )
 
         # Map message
