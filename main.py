@@ -2,20 +2,28 @@ from os import name as os_name, getenv
 from asyncio import run, wait, create_task, FIRST_COMPLETED, Event, get_running_loop, sleep
 from logging import getLogger
 from signal import SIGINT, SIGTERM
-from datetime import datetime, time as t
 from time import time as time_since_epoch
 from io import BytesIO
+from html import escape as he
+from typing import TypeVar, Callable, Any
+from types import CoroutineType
 
-import aiohttp
 from dotenv import load_dotenv
+
+from aiohttp.client_exceptions import ClientConnectorError
+from aiohttp import ClientSession
 from aiogram import Bot, Dispatcher, types
+from aiogram.exceptions import TelegramNetworkError
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, InputMediaPhoto, MediaUnion, InputMediaVideo, ReactionTypeEmoji
 
 from pymax import SocketMaxClient, MaxClient, Message
-from pymax.types import FileAttach, PhotoAttach, VideoAttach
+from pymax.types import PhotoAttach, VideoAttach, FileAttach, StickerAttach
 from pymax.filters import Filters
 from pymax.files import Photo
+
+from gzip import compress
 
 import data_handler
 from logger import setup_logger
@@ -25,12 +33,6 @@ setup_logger()
 l = getLogger(__name__)
 load_dotenv()
 
-# --- Constants & Configuration ---
-CHECK_TIME = False # проверять ли время перед отправкой сообщения (если да, то давать ошибку если START_TIME <= now <= END_TIME)
-START_TIME = t(7, 0)
-END_TIME = t(22, 0)
-
-BOT_START_MESSAGE = None # стартовое сообщение бота отпарвляемое в макс при запуске (если None, то не отпралвять)
 
 REQUESTS_TIMEOUT = 15 # таймаут запросов
 
@@ -54,9 +56,9 @@ except (ValueError, TypeError) as e:
 
 msgs_map = data_handler.load('msgs') or {}
 last_sender_id = None
+sent_by_bot: set[int] = set() # id сообщений отправленных через /send
 
-
-bot = Bot(token=TG_TOKEN)
+bot = Bot(token=TG_TOKEN, default=DefaultBotProperties(parse_mode='HTML'))
 dp = Dispatcher()
 
 # Reconnect=True effectively replaces the "Watchdog" thread
@@ -65,11 +67,23 @@ if USE_SOCKET_CLIENT:
 else:
     client = MaxClient(MAX_PHONE, token=MAX_TOKEN, work_dir="data/cache", reconnect=True)
 
-# --- Helper Functions ---
+T = TypeVar('T')
+
+async def tg_retry[T](func: Callable[..., CoroutineType[Any, Any, T]] | Callable[..., T], *args, retries: int = 10, **kwargs) -> T:
+    for attempt in range(retries):
+        try:
+            return await func(*args, **kwargs) # pyright: ignore[reportGeneralTypeIssues]
+        except (TelegramNetworkError, ClientConnectorError) as e:
+            if attempt == retries - 1:
+                raise e
+            l.warning(f"request failed attempt={attempt + 1}: {e}")
+            await sleep(3)
+    raise
+
 
 async def download_content(url: str) -> BytesIO:
     """Download content from URL into memory."""
-    async with aiohttp.ClientSession() as session:
+    async with ClientSession() as session:
         async with session.get(url, timeout=REQUESTS_TIMEOUT) as response: # pyright: ignore[reportArgumentType]
             response.raise_for_status()
             content = await response.read()
@@ -78,134 +92,79 @@ async def download_content(url: str) -> BytesIO:
             file_bytes.name = response.headers.get("X-File-Name", "file")
             return file_bytes
 
-async def get_sender_name(user_id: int) -> str:
+async def get_sender_name(id: int | None) -> str:
     """Fetch user name via PyMax."""
-    try:
-        user = await client.get_user(user_id=user_id)
-        if user and user.names:
-            return user.names[0].name or ''
-    except Exception as e:
-        l.error(f"Could not fetch profile for ID {user_id}: {e}")
-    return f"User {user_id}"
+    if id is None:
+        return 'неизвестный'
+    user = await client.get_user(user_id=id)
+    if user and user.names:
+        return he(user.names[0].name or '')
+    return str(id)
 
 
 
-async def process_max_message(message: Message, forwarded: bool = False) -> int | None:
-    """
-    Handles messages. Returns the Telegram Message ID of the first part sent.
-    """
-    global last_sender_id
-    assert message.sender
+async def process_max_message(message: Message) -> None:
+    if message.id in sent_by_bot:
+        return
 
-    if not forwarded and getattr(message, 'chat_id', None) != MAX_CHAT_ID:
-        return None
-    if client.me and message.sender == client.me.id:
-        return None
+    text = f'<b>{await get_sender_name(message.sender)} отправил(-a):</b>\n{he(message.text or '')}'
 
-    assert message.chat_id
-
-    msg_id_str = str(message.id) if message.id else "FWD_PART"
-    l.info(f"Processing Max Message ID: {msg_id_str} (Forwarded: {forwarded})")
-    sender = await get_sender_name(message.sender)
-
-    # This will track the FIRST Telegram ID associated with this Max message
-    first_tg_id = None
-
-    header_prefix = ""
-    if not forwarded and last_sender_id != message.sender:
-        header_prefix = f"*{sender} написал:*\n"
-        last_sender_id = sender
-
-    # 3. Reply Mapping (Lookup)
-    reply_to_tg_id = None
+    reply = None
     if message.link and message.link.type == 'REPLY':
-        replied_max_id = str(message.link.message.id)
-        reply_to_tg_id = msgs_map.get(replied_max_id)
-        if reply_to_tg_id:
-            l.info(f"Reply Link: Max[{replied_max_id}] -> TG[{reply_to_tg_id}]")
+        reply = msgs_map.get(str(message.link.message.id))
+        if reply is None:
+            text = '<i><- Ответ на неизвестное сообщение</i>\n' + text
 
-    # 4. Forward Recursion
-    fwds_to_process = []
     if message.link and message.link.type == 'FORWARD':
-        fwds_to_process.append(message.link.message)
-    if hasattr(message, 'fwd_messages') and message.fwd_messages: # pyright: ignore[reportAttributeAccessIssue]
-        fwds_to_process.extend(message.fwd_messages) # pyright: ignore[reportAttributeAccessIssue]
+        text = f'<i>-> Переслано от {await get_sender_name(message.link.message.sender)}</i>\n' + text + message.link.message.text
 
-    for fwd_msg in fwds_to_process:
-        # Recursive call returns the TG ID of the forwarded message
-        fwd_tg_id = await process_max_message(fwd_msg, forwarded=True)
-        # If our container doesn't have a TG ID yet (no header), use the first forward's ID
-        if first_tg_id is None:
-            first_tg_id = fwd_tg_id
+    photos: list[BufferedInputFile] = []
+    video: BufferedInputFile | None = None
+    file: BufferedInputFile | None = None
+    sticker: BufferedInputFile | None = None
+    for attach in message.attaches or []:
+        if isinstance(attach, PhotoAttach):
+            photos.append(BufferedInputFile((await download_content(attach.base_url)).getvalue(), 'photo.jpg'))
+        elif isinstance(attach, VideoAttach):
+            video_data = await client.get_video_by_id(MAX_CHAT_ID, message.id, attach.video_id)
+            if video_data:
+                video = BufferedInputFile((await download_content(video_data.url)).getvalue(), 'video.mp4')
+        elif isinstance(attach, FileAttach):
+            file_data = await client.get_file_by_id(MAX_CHAT_ID, message.id, attach.file_id)
+            if file_data:
+                file = BufferedInputFile((await download_content(file_data.url)).getvalue(), attach.name)
+        elif isinstance(attach, StickerAttach):
+            # photos.append(BufferedInputFile((await download_content(attach.url)).getvalue(), 'sticker.png'))
+            if attach.lottie_url:
+                sticker = BufferedInputFile(compress((await download_content(attach.lottie_url)).getvalue()), 'sticker.tgs')
+            else:
+                photos.append(BufferedInputFile((await download_content(attach.url)).getvalue(), 'sticker.png'))
+            text += '<i>Стикер</i>'
+        else:
+            text += '<i>Неизвестное вложение</i>'
 
-    # 5. Content Prep
-    text_content = message.text or ""
-    if forwarded:
-        text_content = f"↪ Переслано от {sender}:_\n{text_content}"
-    text_content = header_prefix + text_content
+    if len(photos) == 1:
+        tg_message = await bot.send_photo(TG_CHAT_ID, photos[0], caption=text, reply_to_message_id=reply)
+    elif photos:
+        media: list[MediaUnion] = [InputMediaPhoto(media=photo) for photo in photos]
+        media[0].caption = text
+        if video:
+            media.append(InputMediaVideo(media=video))
+        tg_message = (await tg_retry(bot.send_media_group, TG_CHAT_ID, media, reply_to_message_id=reply))[0]
+    elif video:
+        tg_message = await tg_retry(bot.send_video, TG_CHAT_ID, video, caption=text, reply_to_message_id=reply)
+    elif file:
+        tg_message = await tg_retry(bot.send_document, TG_CHAT_ID, file, caption=text, reply_to_message_id=reply)
+    elif sticker:
+        await bot.send_message(TG_CHAT_ID, text)
+        tg_message = await tg_retry(bot.send_sticker, TG_CHAT_ID, sticker, reply_to_message_id=reply)
+    else:
+        tg_message = await tg_retry(bot.send_message, TG_CHAT_ID, text, reply_to_message_id=reply)
 
-    # 6. Attachments
-    if message.attaches:
-        for attach in message.attaches:
-            sent = None
-            try:
-                if isinstance(attach, PhotoAttach):
-                    f_bytes = await download_content(attach.base_url)
-                    sent = await bot.send_photo(
-                        TG_CHAT_ID,
-                        photo=BufferedInputFile(f_bytes.getvalue(), filename="photo.jpg"),
-                        caption=text_content if text_content else None,
-                        reply_to_message_id=reply_to_tg_id,
-                        parse_mode="Markdown"
-                    )
-                elif isinstance(attach, VideoAttach):
-                    vid_info = await client.get_video_by_id(message.chat_id, message.id, attach.video_id)
-                    if vid_info and vid_info.url:
-                        f_bytes = await download_content(vid_info.url)
-                        sent = await bot.send_video(
-                            TG_CHAT_ID,
-                            video=BufferedInputFile(f_bytes.getvalue(), filename="video.mp4"),
-                            caption=text_content if text_content else None,
-                            reply_to_message_id=reply_to_tg_id,
-                            parse_mode="Markdown"
-                        )
-                elif isinstance(attach, FileAttach):
-                    file_info = await client.get_file_by_id(message.chat_id, message.id, attach.file_id)
-                    if file_info and file_info.url:
-                        f_bytes = await download_content(file_info.url)
-                        sent = await bot.send_document(
-                            TG_CHAT_ID,
-                            document=BufferedInputFile(f_bytes.getvalue(), filename=getattr(file_info, 'name', 'file')),
-                            caption=text_content if text_content else None,
-                            reply_to_message_id=reply_to_tg_id,
-                            parse_mode="Markdown"
-                        )
-
-                if sent:
-                    if first_tg_id is None: first_tg_id = sent.message_id
-                    text_content = "" # Only send caption once
-            except Exception as e:
-                l.error(f"Attachment error: {e}")
-
-    # 7. Remaining Text
-    if text_content.strip():
-        sent_msg = await bot.send_message(
-            TG_CHAT_ID,
-            text_content,
-            reply_to_message_id=reply_to_tg_id,
-            parse_mode="Markdown"
-        )
-        if first_tg_id is None: first_tg_id = sent_msg.message_id
-
-    # 8. Save Mapping
-    # We save mapping for both forwarded items and top-level containers
-    if first_tg_id and message.id:
-        msgs_map[str(message.id)] = first_tg_id
-        data_handler.save('msgs', msgs_map)
-        l.info(f"Mapping Saved: Max[{message.id}] == TG[{first_tg_id}]")
+    l.info('receive message text=%s photos=%s video=%s file=%s', text.replace('\n', '  '), len(photos), bool(video), bool(file))
+    msgs_map[str(message.id)] = tg_message.message_id
+    data_handler.save('msgs', msgs_map)
     await client.read_message(message.id, MAX_CHAT_ID)
-
-    return first_tg_id
 
 
 @client.on_message(Filters.chat(MAX_CHAT_ID))
@@ -215,145 +174,91 @@ async def max_message_handler(message: Message):
 
 @client.on_start
 async def on_start():
-    l.info("on_start: getting chat")
     chat = await client.get_chat(MAX_CHAT_ID)
-    l.info(f"on_start: chat.new_messages={chat.new_messages}")
     if chat.new_messages > 0:
-        l.info("on_start: fetching history")
         messages = await client.fetch_history(chat.id, int(time_since_epoch() * 1000), 0, chat.new_messages) or []
-        l.info(f"on_start: fetched {len(messages)} messages")
+        l.info(f"fetched {len(messages)} messages")
         for message in messages:
+            if str(message.id) in msgs_map:
+                l.info(f"skip already forwarded message {message.id}")
+                continue
             message.chat_id = chat.id
             await process_max_message(message)
 
 # --- Logic: Telegram -> Max ---
+
 
 @dp.message(Command("send"))
 async def send_handler(message: types.Message):
     """Handles /send command."""
     assert message.from_user
     try:
-        # Check time
-        now = datetime.now().time()
         if ADMIN_USER_ID and message.from_user.id != ADMIN_USER_ID:
-            await message.reply('Отправка сообщений доступна только администратору')
-            return
-
-        if not (START_TIME <= now <= END_TIME) and CHECK_TIME:
-            await message.reply(f"Можно отправлять сообщения только между {START_TIME:%H:%M} и {END_TIME:%H:%M}")
+            await tg_retry(message.reply, 'Отправка сообщений доступна только администратору')
             return
 
         # Check empty message
-        text_to_send = (message.text or '').replace("/send", "", 1).strip()
-        if not text_to_send and not message.photo:
-            await message.reply("Нельзя отправить пустое сообщение.")
-            return
+        text = (message.text or '').replace("/send", "", 1).strip()
 
         # Get id of replied message in MAX
-        reply_to_max_id = None
+        reply = None
         if message.reply_to_message:
-            tg_reply_id = message.reply_to_message.message_id
-            # Reverse lookup
-            for mid, tid in msgs_map.items():
-                if tid == tg_reply_id:
-                    reply_to_max_id = mid
-                    break
+            reply = next((max_id for max_id, tg_id in msgs_map.items() if tg_id == message.reply_to_message.message_id), None)
 
         photo = None
         if message.photo:
-            photo = await bot.download(message.photo[-1])
+            photo_data = await bot.download(message.photo[-1])
+            if photo_data:
+                photo = Photo(photo_data.read(), path='photo.jpg')
 
-        # Send message
-        sent_msg = await client.send_message(
-            chat_id=MAX_CHAT_ID,
-            text=text_to_send,
-            reply_to=reply_to_max_id,
-            attachment=Photo(photo.read(), path='1.jpg') if photo else None
-        )
+        sent_msg = await client.send_message(text, MAX_CHAT_ID, attachment=photo, reply_to=reply)
 
         # Map message
         if sent_msg and sent_msg.id:
             msgs_map[str(sent_msg.id)] = message.message_id
-            await message.reply("Отправлено!")
+            sent_by_bot.add(sent_msg.id)
+            await tg_retry(message.react, [ReactionTypeEmoji(emoji='👍')])
 
     except Exception as e:
         l.error(f"Error in send_handler: {e}", exc_info=True)
-        await message.reply('Произошла ошибка при отправке.')
+        await tg_retry(message.reply, 'Произошла ошибка при отправке.')
 
-# --- Lifecycle ---
-
-async def on_startup():
-    l.info("Bot started. Transfer is active.")
-
-    # Send startup message (invite link) logic
-    if BOT_START_MESSAGE and not data_handler.load("started"):
-        try:
-            invite = await bot.create_chat_invite_link(TG_CHAT_ID)
-            msg = BOT_START_MESSAGE.replace("TG_CHAT_INVITE_LINK", invite.invite_link)
-            await client.send_message(msg, MAX_CHAT_ID)
-            data_handler.save("started", True)
-        except Exception as e:
-            l.error(f"Failed to send startup message: {e}")
+@dp.message()
+async def reply_hansler(message: types.Message):
+    if message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.is_bot:
+        await send_handler(message)
 
 async def main():
-    # 1. Setup Signal Handling
     stop_event = Event()
     loop = get_running_loop()
     if os_name != 'nt':
         for sig in (SIGINT, SIGTERM):
             loop.add_signal_handler(sig, stop_event.set)
 
-    # 2. Start Telegram Poller FIRST (as a background task)
-    l.info("Starting Telegram Polling...")
-
     async def tg_polling_with_retry():
         while not stop_event.is_set():
-            try:
-                await dp.start_polling(bot)
-            except Exception as e:
-                l.error(f"TG polling crashed: {e}. Retrying in 30s...")
-                await sleep(30)
+            await tg_retry(dp.start_polling, bot)
 
-    tg_task = create_task(tg_polling_with_retry())
+    tg_task = create_task(tg_polling_with_retry(), name='tg')
+    max_task = create_task(client.start(), name='max')
+    stop_task = create_task(stop_event.wait(), name='stop')
+    l.info('start bot')
 
-    # 3. Run startup logic (invite links, etc.)
-    await on_startup()
+    done, _ = await wait(
+        [tg_task, max_task, stop_task],
+        return_when=FIRST_COMPLETED
+    )
+    for task in done:
+        exc = task.exception() if not task.cancelled() else None
+        l.error(f"{task.get_name()} finished exc={exc!r}")
 
-    # 4. Start Max Client (This blocks and keeps the script alive)
-    l.info("Initializing Max Client...")
-    max_task = create_task(client.start())
-    l.debug('inited')
+    tg_task.cancel()
+    max_task.cancel()
 
-    try:
-        # We use a task for Max as well to allow clean shutdowns
-        # Wait for either the stop signal or the tasks to fail
-        stop_task = create_task(stop_event.wait())
-        done, _ = await wait(
-            [tg_task, max_task, stop_task],
-            return_when=FIRST_COMPLETED
-        )
-        for task in done:
-            name = {tg_task: "tg_task", max_task: "max_task", stop_task: "stop_task"}.get(task, "?")
-            exc = task.exception() if not task.cancelled() else None
-            l.warning(f"Task finished: {name}, exception={exc!r}")
+    await client.close()
+    await bot.session.close()
 
-    except Exception as e:
-        l.error(f"Critical error in main loop: {e}")
-
-    finally:
-        l.info("Shutting down...")
-        data_handler.save('msgs', msgs_map)
-
-        # Clean up tasks
-        tg_task.cancel()
-        max_task.cancel()
-
-        await client.close()
-        await bot.session.close()
-        l.info("Shutdown complete.")
-
-if __name__ == '__main__':
-    try:
-        run(main())
-    except (KeyboardInterrupt, SystemExit):
-        l.info("Bot stopped.")
+try:
+    run(main())
+except (KeyboardInterrupt, SystemExit):
+    l.info("stop bot")

@@ -42,7 +42,7 @@ def setup_logger():
     api_log_file = 'data/api_responses.log'
 
     try:
-        open(log_file, 'x').close()
+        open(log_file, 'w').close()
     except IOError as e:
         print(f"Warning: Could not clear log file - {e}")
 
@@ -50,9 +50,9 @@ def setup_logger():
     logger.setLevel(logging.DEBUG)
 
     # --- Formatters ---
-    file_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s', "%Y-%m-%d %H:%M:%S")
-    console_formatter = ConsoleFormatterWithNoTraceback('%(asctime)s [%(levelname)s]: %(message)s', "%Y-%m-%d %H:%M:%S")
-    api_formatter = logging.Formatter('%(asctime)s - %(message)s', "%Y-%m-%d %H:%M:%S")
+    file_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s', "%H:%M:%S")
+    console_formatter = ConsoleFormatterWithNoTraceback('%(asctime)s [%(levelname)s]: %(message)s', "%H:%M:%S")
+    api_formatter = logging.Formatter('%(asctime)s - %(message)s', "%H:%M:%S")
 
     # --- Handlers ---
 
@@ -95,6 +95,6 @@ def setup_logger():
     logging.getLogger("requests").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("aiogram").setLevel(logging.WARNING)
-    logging.getLogger("pymax.core").setLevel(logging.INFO)
+    logging.getLogger("pymax.core").setLevel(logging.WARNING)
 
     return logger, api_logger
